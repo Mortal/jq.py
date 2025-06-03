@@ -283,9 +283,10 @@ cdef class _Program(object):
 
     def input_file(self, file):
         def read(n):
-            # Note that this function ONLY supports text-mode file objects,
-            # since we MUST NOT pass data with split utf8 codepoints to jq.
-            return file.read(n).encode("utf8")
+            s = file.read(n)
+            if isinstance(s, str):
+                return s.encode("utf8")
+            return s
 
         return _ProgramWithInput(self._jq_state_pool, read, slurp=False)
 
@@ -318,8 +319,12 @@ cdef class _ProgramWithInput(object):
     cdef bint _slurp
 
     def __cinit__(self, jq_state_pool, read_next_bytes, *, bint slurp):
-        # read_next_bytes(n) SHOULD return n utf8 codepoints,
-        # and it MUST NOT return data with split utf8 codepoints.
+        # read_next_bytes(n) SHOULD return up to n bytes, or b"" for end of file.
+        # In particular, if read_next_bytes(n) returns data that splits UTF-8 codepoints,
+        # then read_next_bytes(k) for k = 1, 2, 3 being the number of missing bytes,
+        # it MUST return that number of bytes (in order for jq to obtain unsplit codepoints).
+        # If the read_next_bytes() function guarantees to never split UTF-8 codepoints,
+        # it may return any positive number of bytes regardless of the value of n.
         self._jq_state_pool = jq_state_pool
         self._read_next_bytes = read_next_bytes
         self._slurp = slurp
@@ -409,11 +414,23 @@ cdef class _ResultIterator(object):
 
     cdef ssize_t _read_next_input(self) except *:
         self._bytes_input = self._read_next_bytes(4096)
-        # Note, this requires that the output of _read_next_bytes is NOT
-        # split across utf8 codepoints.
         cdef char* cbytes_input = NULL
         cdef ssize_t clen_input = 0
         PyBytes_AsStringAndSize(self._bytes_input, &cbytes_input, &clen_input)
+        cdef int missing_bytes
+        cdef const char* backtrack
+        cdef bytes extra_bytes
+        if clen_input > 0:
+            # Check for UTF-8 backtrack
+            missing_bytes = 0
+            backtrack = _jvp_utf8_backtrack(cbytes_input + clen_input - 1,
+                                            cbytes_input,
+                                            &missing_bytes)
+            if backtrack != NULL and missing_bytes > 0:
+                # Attempt to read extra bytes
+                extra_bytes = self._read_next_bytes(missing_bytes)
+                self._bytes_input = self._bytes_input + extra_bytes
+                PyBytes_AsStringAndSize(self._bytes_input, &cbytes_input, &clen_input)
         jv_parser_set_buf(self._parser, cbytes_input, clen_input, 0)
         return clen_input
 
@@ -432,6 +449,55 @@ cdef class _ResultIterator(object):
                 jv_free(value)
                 if self._read_next_input() <= 0:
                     raise StopIteration()
+
+
+cdef const char* _jvp_utf8_backtrack(const char* start, const char* min, int* missing_bytes):
+    # Ported from jv_unicode.h, which unfortunately does not ship with jq.
+    # "jvp_utf8_backtrack returns the beginning of the last codepoint in the
+    #  string, assuming that start is the last byte in the string.
+    #  If the last codepoint is incomplete, returns the number of missing bytes via
+    #  *missing_bytes.  If there are no leading bytes or an invalid byte is
+    #  encountered, NULL is returned and *missing_bytes is not altered."
+
+    assert min <= start
+    if min == start:
+        return min
+
+    cdef int length = 0
+    cdef int seen = 1
+
+    while start >= min and (length := _utf8_coding_length[<unsigned char>start[0]]) == _utf8_continuation_byte:
+        start -= 1
+        seen += 1
+
+    if length == 0 or length == _utf8_continuation_byte or length - seen < 0:
+        return NULL
+
+    if missing_bytes is not NULL:
+        missing_bytes[0] = length - seen
+
+    return start
+
+cdef unsigned char _utf8_continuation_byte = 255
+
+cdef unsigned char[256] _utf8_coding_length = [
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+  0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+  0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+]
 
 
 def all(program, value=_NO_VALUE, text=_NO_VALUE):
